@@ -71,6 +71,26 @@ audio = lina_tokenizer.convert_voice(source_wav, reference_wav)
 display(Audio(audio.cpu(), rate=48000))
 ```
 
+### Voice Packs
+
+LinaCodec voice conversion works by **keeping source content tokens** and **swapping the `global_embedding`** (timbre/style).  
+This repo adds **Voice Packs**: a conditional **normalizing flow (RealNVP-style affine coupling with a Transformer conditioner)**
+that samples a base `global_embedding`
+*plus* a small **adapter** that turns it into a **time-varying decoder conditioning sequence** from the source’s content embeddings.
+This way you don’t need reference audio at inference time, and you don’t retrain LinaCodec itself. Plus the voice pack can encode much more style information than a single reference audio.
+
+Train a voice pack from target-voice audio:
+
+```bash
+python train_voice_pack.py --audio_dir /path/to/target_voice_wavs --output /path/to/voice_pack.pt
+```
+
+Convert with a trained voice pack:
+
+```bash
+python convert.py --source /path/to/source.wav --voice_pack /path/to/voice_pack.pt --output /path/to/out.wav --temperature 1.0
+```
+
 Audio super resolution
 ```python
 ## get speech tokens and global embedding from 24khz wav

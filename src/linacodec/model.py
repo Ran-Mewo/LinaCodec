@@ -68,13 +68,15 @@ class LinaCodecModel(nn.Module):
         self._init_global_branch(global_encoder)
         self._init_mel_decoder(config, mel_prenet, mel_decoder, mel_postnet)
         
-    def load_distilled_wavlm(self, path: str):
+    def load_distilled_wavlm(self, path: str, device=None):
         """Loads distilled wavlm model, 970m params --> 250m params"""
-        ckpt = torch.load(path)
+        ckpt = torch.load(path, map_location="cpu")
         wavlm_model = wav2vec2_model(**ckpt["config"])
         result = wavlm_model.load_state_dict(ckpt["state_dict"], strict=False)
-        self.wavlm_model = wavlm_model.cuda()
-        self.distilled_layers = [6, 8] ## can set custom, 6-8 seems best however
+        device = device or next(self.parameters()).device
+        self.wavlm_model = wavlm_model.to(device)
+        self.distilled_layers = [6, 8]  # can set custom, 6-8 seems best however
+        return result
 
     def _init_ssl_extractor(self, config: LinaCodecConfig, ssl_feature_extractor: SSLFeatureExtractor):
         """Initialize and configure SSL feature extractor."""
@@ -235,8 +237,8 @@ class LinaCodecModel(nn.Module):
             waveform = waveform.squeeze(1)
 
         # 1. Extract SSL features
-        if padding > 0:
-            waveform = F.pad(waveform, (padding, padding), mode="constant")
+        if (pad := (padding or 0)) > 0:
+            waveform = F.pad(waveform, (pad, pad), mode="constant")
 
         with torch.no_grad():
             acoustic_wavlm_features = self.ssl_feature_extractor(waveform, num_layers=2) ## only needs 2 layers as acoustic info is present in them
@@ -252,7 +254,7 @@ class LinaCodecModel(nn.Module):
 
     def forward_content(
         self, local_ssl_features: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """Forward pass to extract content embeddings from the local branch.
         Args:
             local_ssl_features: Local SSL features tensor of shape (B, T, C)
@@ -318,7 +320,7 @@ class LinaCodecModel(nn.Module):
         """Forward pass to generate mel spectrogram from content and global embeddings.
         Args:
             content_embeddings: Content embeddings tensor of shape (B, T, C)
-            global_embeddings: Global embeddings tensor of shape (B, C)
+            global_embeddings: Global conditioning tensor of shape (B, C) or (B, L_cond, C)
             mel_length: Target mel spectrogram length (T_mel)
         Returns:
             mel_recon: Reconstructed mel spectrogram tensor of shape (B, n_mels, T_mel)
@@ -334,8 +336,18 @@ class LinaCodecModel(nn.Module):
             local_latent.transpose(1, 2), size=mel_length, mode=self.config.mel_interpolation_mode
         ).transpose(1, 2)  # (B, T_current, C) -> (B, T_mel, C)
 
-        # Generate mel spectrogram, conditioned on global embeddings
-        mel_recon = self.mel_decoder(local_latent, condition=global_embeddings.unsqueeze(1))
+        # Generate mel spectrogram, conditioned on global embeddings.
+        # `global_embeddings` can be either:
+        # - (B, C)         : utterance-level conditioning
+        # - (B, L_cond, C) : time-varying conditioning (will be resampled to mel_length)
+        cond = global_embeddings
+        if cond.dim() == 2:
+            cond = cond.unsqueeze(1)
+        elif cond.dim() == 3 and cond.size(1) != mel_length:
+            cond = F.interpolate(cond.transpose(1, 2), size=mel_length, mode="linear", align_corners=False).transpose(
+                1, 2
+            )
+        mel_recon = self.mel_decoder(local_latent, condition=cond)
         mel_recon = mel_recon.transpose(1, 2)  # (B, n_mels, T)
 
         mel_recon = self.mel_postnet(mel_recon)
@@ -359,11 +371,11 @@ class LinaCodecModel(nn.Module):
 
     @classmethod
     def from_hparams(cls, config_path: str) -> "LinaCodecModel":
-        """Instantiate KanadeModel from config file.
+        """Instantiate LinaCodecModel from config file.
         Args:
             config_path (str): Path to model configuration file (.yaml).
         Returns:
-            KanadeModel: Instantiated KanadeModel.
+            LinaCodecModel: Instantiated LinaCodecModel.
         """
         parser = jsonargparse.ArgumentParser(exit_on_error=False)
         parser.add_argument("--model", type=LinaCodecModel)
@@ -378,7 +390,7 @@ class LinaCodecModel(nn.Module):
         revision: str | None = None,
         config_path: str | None = None,
         weights_path: str | None = None,
-    ) -> "KanadeModel":
+    ) -> "LinaCodecModel":
         """Load LinaCodec either from HuggingFace Hub or local config and weights files.
         Args:
             repo_id (str, optional): HuggingFace Hub repository ID. If provided, loads config and weights from the hub.
@@ -386,7 +398,7 @@ class LinaCodecModel(nn.Module):
             config_path (str, optional): Path to model configuration file (.yaml). Required if repo_id is not provided.
             weights_path (str, optional): Path to model weights file (.safetensors). Required if repo_id is not provided.
         Returns:
-            LinaCodec: Loaded LinaCodec instance.
+            LinaCodecModel: Loaded LinaCodec model instance.
         """
         if repo_id is not None:
             # Load from HuggingFace Hub
@@ -428,7 +440,7 @@ class LinaCodecModel(nn.Module):
         local_ssl_features, global_ssl_features = self.forward_ssl_features(waveform.unsqueeze(0), padding=padding)
 
         result = LinaCodecFeatures()
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+        with torch.autocast(device_type=waveform.device.type, dtype=torch.bfloat16, enabled=waveform.is_cuda):
             if return_content:
                 content_embedding, token_indices, _, _ = self.forward_content(local_ssl_features)
                 result.content_embedding = content_embedding.squeeze(0)  # (seq_len, dim)
@@ -455,7 +467,9 @@ class LinaCodecModel(nn.Module):
     ) -> torch.Tensor:
         """Synthesize audio from content and global features using LinaCodec model and Vocos.
         Args:
-            global_embedding (torch.Tensor): Global embedding tensor (dim,).
+            global_embedding (torch.Tensor): Global conditioning tensor.
+                - (dim,) for utterance-level conditioning, OR
+                - (L_cond, dim) for time-varying conditioning (will be resampled to mel length).
             content_token_indices (torch.Tensor, optional): Optional content token indices tensor (seq_len).
             content_embedding (torch.Tensor, optional): Optional content embedding tensor (seq_len, dim).
                 If both content_token_indices and content_embedding are provided, content_embedding takes precedence.
@@ -475,10 +489,13 @@ class LinaCodecModel(nn.Module):
             seq_len = content_embedding.size(0)
             target_audio_length = self._calculate_original_audio_length(seq_len)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+        with torch.autocast(
+            device_type=global_embedding.device.type, dtype=torch.bfloat16, enabled=global_embedding.is_cuda
+        ):
             mel_length = self._calculate_target_mel_length(target_audio_length)
             content_embedding = content_embedding.unsqueeze(0)  # (1, seq_len, dim)
-            global_embedding = global_embedding.unsqueeze(0)  # (1, dim)
+            if global_embedding.dim() in (1, 2):
+                global_embedding = global_embedding.unsqueeze(0)  # (1, dim) or (1, L_cond, dim)
             mel_spectrogram = self.forward_mel(content_embedding, global_embedding, mel_length=mel_length)
 
         return mel_spectrogram.squeeze(0)  # (n_mels, T)

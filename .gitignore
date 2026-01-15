@@ -235,3 +235,5 @@ pyrightconfig.json
 /archive/
 /notebook/
 uv.lock
+FURRIE-1-old/
+.venv/
